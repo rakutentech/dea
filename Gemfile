@@ -10,11 +10,13 @@ gem 'rake'
 gem 'thin'
 gem 'yajl-ruby', :require => ['yajl', 'yajl/json_gem']
 
-# FIXME: we should use the CF org instead of Jesse's personal repo...
-gem 'vcap_common', '~> 1.0.8', :git => 'https://github.com/cloudfoundry/vcap-common.git', :ref => '9673dced'
+# FIXME: we use Rakutentech vcap-common repo here to use latest version of 'yajl-ruby' gem needed by fluentd
+gem 'vcap_common', '~> 2.0.2', :git => 'https://github.com/rakutentech/vcap-common.git', :ref => 'e55dde0'
 gem 'vcap_logging', :require => ['vcap/logging'], :git => 'https://github.com/cloudfoundry/common.git', :ref => 'e36886a1'
 
 gem 'sys-filesystem', '~> 1.0.0'
+
+gem 'fluentd'
 
 group :test do
   gem "rspec"

@@ -71,6 +71,22 @@ describe 'DEA Agent' do
       'disable_dir_cleanup' => false,
       'force_http_sharing' => true,
       'droplet_fs_percent_used_threshold' => 100, # don't fail if a developer's machine is almost full
+      'app_logs_server_conf' => {
+        'send_timeout'       => '20s',
+        'recover_wait'       => '5s',
+        'heartbeat_interval' => '1s',
+        'phi_threshold'      => 8,
+        'hard_timeout'       => '60s',
+        'flush_interval'     => '0s',
+        'primary'  =>  {
+          'host'   =>  '127.0.0.1',
+          'port'   =>  4224
+        },
+        'secondary'  =>  {
+          'host'     =>  '127.0.0.1',
+          'port'     =>  4225
+        }
+      }
     }
     @dea_config_file = File.join(@run_dir, 'dea.config')
     File.open(@dea_config_file, 'w') {|f| YAML.dump(@dea_cfg, f) }
@@ -161,6 +177,17 @@ describe 'DEA Agent' do
       wait_for do
         droplet_infos.all? { |info| port_open?(info['port']) }
       end.should be_true
+    end
+
+    it 'should start a fluentd process per instance' do
+      droplet_info = start_droplet(@nats_server.uri, @droplet)
+      droplet_info.should_not be_nil
+
+      fluentd_pid  = %x[find #{@run_dir} -name fluentd.pid].chomp
+      fluentd_conf = %x[find #{@run_dir} -name fluentd.conf].chomp
+
+      File.open(fluentd_pid).read.to_i.should > 0
+      File.open(fluentd_conf).read.should_not be_empty
     end
 
     it 'should heartbeat a running droplet' do
@@ -316,11 +343,13 @@ describe 'DEA Agent' do
     {
       'sha1'     => Digest::SHA1.hexdigest(File.read(bundle_filename)),
       'droplet'  => 1,
+      'index'    => 0,
       'name'     => 'test_app',
       'services' => {},
       'uris'     => ['test_app.vcap.me'],
       'executableFile' => bundle_filename,
       'executableUri'  => "http://localhost:#{@file_port}/droplet",
+      'users'          => ['user@example.com'],
       'runtime'        => 'ruby18',
       'framework'      => 'sinatra'
     }

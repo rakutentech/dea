@@ -78,6 +78,9 @@ module DEA
     DROPLET_FS_PERCENT_USED_THRESHOLD = 95
     DROPLET_FS_PERCENT_USED_UPDATE_INTERVAL = 2
 
+    FLUENTD_MAX_RESTART_ATTEMPTS = 5
+    FLUENTD_CHILD_REAPER_TIMEOUT = 2*60 # Force kill an ending fluentd child process after 2 minutes
+
     def initialize(config)
       VCAP::Logging.setup_from_config(config['logging'])
       @logger = VCAP::Logging.logger('dea')
@@ -103,6 +106,7 @@ module DEA
       @prod = config['prod']
 
       @local_ip     = VCAP.local_ip(config['local_route'])
+      @logging_ip   = VCAP.local_ip(config['logging_route'])
       @max_memory   = config['max_memory'] # in MB
       @multi_tenant = config['multi_tenant']
       @max_clients  = @multi_tenant ? DEFAULT_MAX_CLIENTS : 1
@@ -123,6 +127,9 @@ module DEA
       @apps_dir       = File.join(@droplet_dir, 'apps')
       @db_dir         = File.join(@droplet_dir, 'db')
       @app_state_file = File.join(@db_dir, APP_STATE_FILE)
+
+      @fluentd_plugins_dir  = File.expand_path("../../fluentd/", __FILE__)
+      @app_logs_server_conf = config['app_logs_server_conf']
 
       # The DEA will no longer respond to discover/start requests once this usage
       # threshold (in percent) has been exceeded on the filesystem housing the
@@ -465,7 +472,10 @@ module DEA
               :debug_ip => instance[:debug_ip],
               :debug_port => instance[:debug_port],
               :console_ip => instance[:console_ip],
-              :console_port => instance[:console_port]
+              :console_port => instance[:console_port],
+              :logging_ip => instance[:logging_ip],
+              :logging_port => instance[:logging_port],
+              :logging_stream_port => instance[:logging_stream_port]
             }
             if include_stats && instance[:state] == :RUNNING
               response[:stats] = {
@@ -671,6 +681,25 @@ module DEA
           end
         end
 
+        logging_port = grab_port
+        if logging_port
+          instance[:logging_ip] = @logging_ip
+          instance[:logging_port] = logging_port
+        else
+          @logger.warn("Unable to allocate fluentd logging port for instance#{instance[:log_id]}")
+          stop_droplet(instance)
+          return
+        end
+
+        logging_stream_port = grab_port
+        if logging_stream_port
+          instance[:logging_stream_port] = logging_stream_port
+        else
+          @logger.warn("Unable to allocate fluentd logging stream port for instance#{instance[:log_id]}")
+          stop_droplet(instance)
+          return
+        end
+
         @logger.info("Starting up instance #{instance[:log_id]} on port:#{instance[:port]} " +
                      "#{"debuger:" if instance[:debug_port]}#{instance[:debug_port]}" +
                      "#{"console:" if instance[:console_port]}#{instance[:console_port]}")
@@ -685,6 +714,17 @@ module DEA
         # once EM allows proper close_on_exec we can remove
         FileUtils.cp(File.expand_path("../../../bin/close_fds", __FILE__), prepare_script)
         FileUtils.chmod(0700, prepare_script)
+
+        # Create fluentd directory and scripts to manage it
+        # fluentd/
+        #   |-- fluentd.conf
+        #   |-- startup
+        #   `-- stop
+        # fluentd.pid
+        if not setup_fluentd_for_app(instance)
+          stop_droplet(instance)
+          return
+        end
 
         # Secure mode requires a platform-specific shell command.
         if @secure
@@ -750,6 +790,9 @@ module DEA
         kill_all_procs_for_user(user) if @secure
 
         Bundler.with_clean_env { EM.system("#{@dea_ruby} -- #{prepare_script} true #{sh_command}", exec_operation, exit_operation) }
+
+        # Start monitoring the logs from an application and enable tail support
+        start_fluentd_for_app(instance)
 
         instance[:staged] = instance_dir.sub("#{@apps_dir}/", '')
 
@@ -1191,6 +1234,9 @@ module DEA
       env << "VCAP_DEBUG_PORT='#{instance[:debug_port]}'"
       env << "VCAP_CONSOLE_IP='#{instance[:console_ip]}'"
       env << "VCAP_CONSOLE_PORT='#{instance[:console_port]}'"
+      env << "VCAP_LOG_IP='#{instance[:logging_ip]}'"
+      env << "VCAP_LOG_PORT='#{instance[:logging_port]}'"
+      env << "VCAP_LOG_STREAM_PORT='#{instance[:logging_stream_port]}'"
 
       if vars = debug_env(instance)
         @logger.info("Debugger environment variables: #{vars.inspect}")
@@ -1318,6 +1364,9 @@ module DEA
       # Mark that we have processed the stop command.
       instance[:stop_processed] = true
 
+      # Stop the logging daemon assigned to this instance before cleaning.
+      stop_fluentd_for_app(instance)
+
       # Cleanup resource usage and files..
       cleanup_droplet(instance)
     end
@@ -1342,6 +1391,136 @@ module DEA
       else
         @logger.debug("#{instance[:name]}: Chowning crashed dir #{instance[:dir]}")
         EM.system("chown -R #{Process.euid}:#{Process.egid} #{instance[:dir]}")
+      end
+    end
+
+    def setup_fluentd_for_app(instance)
+      @logger.info("Setting up fluentd for instance #{instance[:log_id]}")
+
+      fluentd_dir = File.expand_path(File.join(instance[:dir], 'fluentd'))
+      FileUtils.mkdir_p(fluentd_dir)
+
+      fluentd_conf = <<-FLUENTD
+<source>
+  type forward
+  port #{instance[:logging_port]}
+</source>
+<source>
+  type cf_app_logs
+  name           #{instance[:name]}
+  instance_id    #{instance[:instance_id]}
+  instance_index #{instance[:instance_index]}
+  instance_dir   #{instance[:dir]}
+  runtime        #{instance[:runtime]}
+  framework      #{instance[:framework]}
+  tag            logs.storage
+</source>
+<match logs.**>
+  type copy
+  <store>
+    type cf_app_forward
+    send_timeout       #{@app_logs_server_conf['send_timeout']}
+    recover_wait       #{@app_logs_server_conf['recover_wait']}
+    heartbeat_interval #{@app_logs_server_conf['heartbeat_interval']}
+    phi_threshold      #{@app_logs_server_conf['phi_threshold']}
+    hard_timeout       #{@app_logs_server_conf['hard_timeout']}
+    flush_interval     #{@app_logs_server_conf['flush_interval']}
+    buffer_type file
+    buffer_path fluentd/fluentd_buffer
+
+    cf_app_user           #{instance[:users].first}
+    cf_app_name           #{instance[:name]}
+    cf_app_instance_id    #{instance[:instance_id]}
+    cf_app_instance_index #{instance[:instance_index]}
+
+    <server>
+      name logserver
+      host #{@app_logs_server_conf['primary']['host']}
+      port #{@app_logs_server_conf['primary']['port']}
+    </server>
+    <server>
+      name backup_logserver
+      host #{@app_logs_server_conf['secondary']['host']}
+      port #{@app_logs_server_conf['secondary']['port']}
+      standby
+    </server>
+  </store>
+  <store>
+     type cf_app_logs_streaming
+     port #{instance[:logging_stream_port]}
+  </store>
+</match>
+FLUENTD
+      fluentd_conf_file = File.join(fluentd_dir, 'fluentd.conf')
+      File.open(fluentd_conf_file, 'w') do |file|
+        file.write(fluentd_conf)
+      end
+      FileUtils.chmod(0500, fluentd_conf_file)
+
+      fluentd_startup = <<-FLUENTD
+#!/bin/bash
+#{@dea_ruby} -S fluentd -c #{instance[:dir]}/fluentd/fluentd.conf -p #{@fluentd_plugins_dir} -vv >> ./logs/fluentd.log 2>> ./logs/fluentd.log &
+FLUENTD_STARTED=$!
+echo "$FLUENTD_STARTED" > fluentd.pid
+FLUENTD
+      fluentd_startup_file = File.join(fluentd_dir, 'startup')
+      File.open(fluentd_startup_file, 'w') do |file|
+        file.write(fluentd_startup)
+      end
+      FileUtils.chmod(0500, fluentd_startup_file)
+      fluentd_stop = <<-FLUENTD
+#!/bin/bash
+FLUENTD_PID=`head -1 #{instance[:dir]}/fluentd.pid`
+CHILDPIDS=$(pgrep -P $FLUENTD_PID -d ' ')
+kill -9 ${FLUENTD_PID}
+for CPID in ${CHILDPIDS};do
+  kill -9 ${CPID}
+done
+FLUENTD
+      fluentd_stop_file = File.join(fluentd_dir, 'stop')
+      File.open(fluentd_stop_file, 'w') do |file|
+        file.write(fluentd_stop)
+      end
+      FileUtils.chmod(0500, fluentd_stop_file)
+
+      return true
+    end
+
+    def start_fluentd_for_app(instance)
+      Bundler.with_clean_env do
+        EM.system('/bin/sh',
+                  proc do |process|
+                    process.send_data("cd #{instance[:dir]}\n")
+                    process.send_data("./fluentd/startup\n")
+                    process.send_data("exit\n")
+                  end,
+                  proc do |output|
+                    @logger.info("Attempted to start fluentd for instance#{instance[:log_id]}")
+                    if instance[:logging_restart_attempts]
+                      instance[:logging_restart_attempts] += 1
+                    end
+                  end)
+      end
+    end
+
+    def stop_fluentd_for_app(instance)
+      fluentd_stop_script = File.expand_path(File.join(instance[:dir], 'fluentd', 'stop'))
+      fluentd_pid_file = fluentd_pid_file  = File.join(instance[:dir], 'fluentd.pid')
+
+      if File.exists?(fluentd_pid_file)
+        fluentd_pid = File.open(fluentd_pid_file).read.chomp.to_i
+        if fluentd_pid != 0
+          begin
+            Process.kill(0, fluentd_pid)
+            @logger.debug "Stopping Fluentd for instance #{instance[:log_id]}"
+            command = "env -i /bin/sh #{fluentd_stop_script}"
+            system(command)
+          rescue Errno::ESRCH
+            @logger.info("No fluentd process found runnning for instance#{instance[:log_id]}")
+          end
+        else
+          @logger.error("Cannot stop fluentd process due to invalid pid: instance#{instance[:log_id]}")
+        end
       end
     end
 
@@ -1560,6 +1739,9 @@ module DEA
 
         EM.system('/bin/sh', du_proc, cont_proc)
       end
+
+      # Check the status of the fluentds after having monitored the apps
+      monitor_fluentd_processes
     end
 
     def monitor_apps_helper(startup_check, ma_start, du_start, du_all_out, pid_info, user_info)
@@ -1644,6 +1826,127 @@ module DEA
       ttlog = Time.now - ma_start
       @logger.warn("Took #{ttlog} to process ps and du stats") if ttlog > 0.4
       EM.add_timer(MONITOR_INTERVAL) { monitor_apps(false) } unless startup_check
+    end
+
+    def monitor_fluentd_processes
+      @droplets.each_value do |instances|
+        instances.each_value do |instance|
+          fluentd_parent_pid_file  = File.join(instance[:dir], 'fluentd.pid')
+          fluentd_child_pid_file = File.join(instance[:dir], 'fluentd_child.pid')
+
+          # Don't do anything if there is no pid_file
+          # since there has not been an attempt to start fluentd yet
+          next unless File.exists?(fluentd_parent_pid_file)
+
+          fluentd_parent_pid = File.open(fluentd_parent_pid_file).read.chomp.to_i
+
+          if not File.exists?(fluentd_child_pid_file)
+            update_fluentd_child_pid_file(instance, fluentd_parent_pid)
+          else
+            # This the pid of the latest child process from fluentd
+            fluentd_child_pid = File.open(fluentd_child_pid_file).read.chomp.to_i
+
+            # Try to get the current child process from fluentd as well,
+            # 0 means that there is no detached fluentd process from the parent anymore
+            latest_fluentd_child_pid = `pgrep -P #{fluentd_parent_pid}`.chomp.to_i
+
+            if instance[:logging_restarting]
+
+              begin
+                # Check if the child fluentd process has finished restarting
+                # having issued the TERM signal
+                if fluentd_child_pid != 0
+                  Process.kill(0, fluentd_child_pid)
+                  if (Time.now - instance[:logging_restarting_time]) > FLUENTD_CHILD_REAPER_TIMEOUT
+                    Process.kill(9, fluentd_child_pid)
+                    @logger.error("Restart fluentd child process timeout for #{instance[:log_id]} at #{@local_ip}")
+                  else
+                    # We have to wait for the child fluentd process to exit before starting a new parent
+                    next
+                  end
+                else
+                  @logger.error("Invalid pid for fluentd child process for instance#{instance[:log_id]} at #{@local_ip}")
+                end
+              rescue Errno::ESRCH
+                # This means that the fluentd_child process finished restarting.
+                # Now we can start another pair of fluentd processes
+                instance[:logging_restarting] = false
+                instance[:logging_restarting_time] = nil
+              end
+            elsif latest_fluentd_child_pid != 0 and latest_fluentd_child_pid != fluentd_child_pid
+              # We update the fluentd_child pid in case it was restarted by fluentd supervisor
+              update_fluentd_child_pid_file(instance, fluentd_parent_pid)
+            end
+          end
+
+          begin
+            # Confirm that the fluentd process is alive
+            if fluentd_parent_pid != 0
+              Process.kill(0, fluentd_parent_pid)
+            else
+              @logger.error("Fluentd failed to start for instance#{instance[:log_id]} at #{@local_ip}")
+            end
+            instance[:logging_restart_attempts] = 0
+          rescue Errno::ESRCH
+
+            # In case the VCAP_LOG_PORT was stolen while fluentd logger was down,
+            # it will not be able to restart so the instance itself needs to be restarted
+            instance[:logging_restart_attempts] ||= 0
+
+            # The fluentd process is dead, we have to start it.
+            # But first, we check that the application is not being stopped
+            if instance[:stop_processed].nil? or instance[:stop_processed] == false
+
+              if instance[:logging_restart_attempts] == FLUENTD_MAX_RESTART_ATTEMPTS
+                @logger.error("Too many restart attempts to restart fluentd logger. Restarting the application instance#{instance[:log_id]} at #{@local_ip}")
+                stop_droplet(instance)
+              end
+
+              # Before restart, we have to kill the second detached fluentd in case it exists,
+              # because it is listening to the same original port so it won't let the parent start
+              if File.exists?(fluentd_child_pid_file) and not instance[:logging_restarting]
+                if fluentd_child_pid != 0
+                  begin
+                    # Let it forward the remaining logs and send shutdown signal
+                    instance[:logging_restarting] = true
+                    instance[:logging_restarting_time] = Time.now
+                    Process.kill('TERM', fluentd_child_pid)
+                    @logger.info("Restarting fluentd logger... Finish sending logs for instance#{instance[:log_id]}")
+                    # The detached fluent process will take some time to exit
+                    # and finish sending the logs. If another fluentd process tries
+                    # to restart during this time it will fail because it won't be able
+                    # to listen to the port, so we just skip this time.
+                    next
+                  rescue Errno::ESRCH
+                    # Both fluentd processes are dead. Start the logger again.
+                    @logger.warn("Could not stop fluentd child process from instance#{instance[:log_id]} at #{@local_ip}}")
+                  end
+                end
+              end
+
+              # We don't have to check if it started because another timer would take care of that
+              start_fluentd_for_app(instance)
+            else
+              # Don't anything and wait for stopped application to be cleaned up from DEA
+              # @logger.debug("Ignore fluentd start due to stop signal: instance#{instance[:log_id]}")
+            end
+          end
+        end
+      end
+    end
+
+    def update_fluentd_child_pid_file(instance, fluentd_parent_pid)
+      Bundler.with_clean_env do
+        EM.system('/bin/sh',
+                  proc do |process|
+                    process.send_data("cd #{instance[:dir]}\n")
+                    process.send_data("pgrep -P #{fluentd_parent_pid} > fluentd_child.pid\n")
+                    process.send_data("exit\n")
+                  end,
+                  proc do |output|
+                    @logger.debug("Updated fluentd child process for instance#{instance[:log_id]}")
+                  end)
+      end
     end
 
     # This is for general access to the file system for the staged droplets.

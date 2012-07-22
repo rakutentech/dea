@@ -12,6 +12,7 @@ droplet_fs_percent_used_threshold: 95
 # and IP addresses assigned to them) of the host running the DEA. Default
 # value of nil, should work in most cases.
 local_route: 127.0.0.1
+logging_route: 127.0.0.1
 
 # Port for accessing the files of running applications
 filer_port: 12345
@@ -24,6 +25,21 @@ intervals:
   advertise: 5
 logging:
   level: debug
+
+# Available AppLogsServer
+app_logs_server_conf:
+  send_timeout: 20s
+  recover_wait: 5s
+  heartbeat_interval: 1s
+  phi_threshold: 8
+  hard_timeout: 60s
+  flush_interval: 0s
+  primary:
+    host: 127.0.0.1
+    port: 4224
+  secondary:
+    host: 127.0.0.1
+    port: 4225
 
 # Allow more than one application to run per DEA
 multi_tenant: true
